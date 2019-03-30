@@ -145,4 +145,17 @@
  * 简介：
 ### truncate
  * 安装：bin/logstash-plugin install logstash-filter-truncate  
+ * 简介：截断比给定长度更长的字段
+### urldecode
+ * 简介：解析urlEncode的字符串。
+### useragent
+ * 简介：获取浏览器中的UserAgent字段
+### uuid
+ * 简介：添加uuid字段
+### xml
+ * 简介：解析xml数据
+### yaml
+ * 简介：解析yaml数据
+### zeromq
+ * 安装：bin/logstash-plugin install logstash-filter-zeromq  
  * 简介：
