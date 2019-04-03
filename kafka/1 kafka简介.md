@@ -1,3 +1,55 @@
+### 线程模型
+&emsp; Kafka采用一个Acceptor线程处理客户端的链接请求，然后轮询processors列表，将网络io事件交由processor处理。  
+&emsp; processor中的read方法读取请求内容，write将返回内容发送给客户端。如果read读取完毕，则构造Request对象，放入RequestChannel里等待处理。  
+&emsp; KafkaRequestHandlerPool负责处理RequestChannel的requestQueue里面的请求。线程池的数量通过num.io.threads设置(默认8个线程)。获取请求后调用ApiUtils处理请求。
+&emsp; KafkaApis会判断用户的请求类型RequestKeys，然后对应的处理函数处理请求，并得到response，通过调用RequestChannel的sendRespoonse将respoonse放入RequestChannel的responseQueue中。processor获取response并将结果返回客户端。  
+
+* processors：默认为3，处理socket的读写事件  
+* RequestChannel：包括两个队列requestQueue(ArrayBlockingQueue实现)和responseQueues(数组+BlockingQueue实现)。  
+* requestQueue：默认大小500,内部实现为ArrayBlockingQueue缓存请求  
+* responseQueues：数组+BlockingQueue实现，数组的长度和processor的数量相同，每个processors只处理自己的response  
+
+### Kafka partition数据倾斜
+&emsp; Kafka0.8版本，客户端发送消息的时候如果在消息中没有指定key，则在DefaultEventHandler中选择消息发送的partition的时候会从sendPartitionPerTopicCache中获取缓存的partiton，缓存在partition丢失、leader不存在或者topic.metadata.refresh.interval.ms
+（默认10分钟）后失效，则10min内所有的消息都会发送到同一个分区，造成kafka中partition的数据倾斜。官方解释是：减少服务器端的socket连接数。代码如下所示：
+
+	private def getPartition(topic: String, key: Any, topicPartitionList: Seq[PartitionAndLeader]): Int = {
+    val numPartitions = topicPartitionList.size
+    if(numPartitions <= 0)
+      throw new UnknownTopicOrPartitionException("Topic " + topic + " doesn't exist")
+    val partition =
+      if(key == null) {
+        // If the key is null, we don't really need a partitioner
+        // So we look up in the send partition cache for the topic to decide the target partition
+        val id = sendPartitionPerTopicCache.get(topic)
+        id match {
+          case Some(partitionId) =>
+            // directly return the partitionId without checking availability of the leader,
+            // since we want to postpone the failure until the send operation anyways
+            partitionId
+          case None =>
+            val availablePartitions = topicPartitionList.filter(_.leaderBrokerIdOpt.isDefined)
+            if (availablePartitions.isEmpty)
+              throw new LeaderNotAvailableException("No leader for any partition in topic " + topic)
+            val index = Utils.abs(Random.nextInt) % availablePartitions.size
+            val partitionId = availablePartitions(index).partitionId
+            sendPartitionPerTopicCache.put(topic, partitionId)
+            partitionId
+        }
+      } else
+        partitioner.partition(key, numPartitions)
+    if(partition < 0 || partition >= numPartitions)
+      throw new UnknownTopicOrPartitionException("Invalid partition id: " + partition + " for topic " + topic +
+        "; Valid values are in the inclusive range of [0, " + (numPartitions-1) + "]")
+    trace("Assigning message of topic %s and key %s to a selected partition %d".format(topic, if (key == null) "[none]" else key.toString, partition))
+    partition
+  }
+ 
+&emsp;官方配置文件说明：  
+* key: topic.metadata.refresh.interval.ms	
+* value: 600 * 1000	
+* desc: The producer generally refreshes the topic metadata from brokers when there is a failure (partition missing, leader not available...). It will also poll regularly (default: every 10min so 600000ms). If you set this to a negative value, metadata will only get refreshed on failure. If you set this to zero, the metadata will get refreshed after each message sent (not recommended). Important note: the refresh happen only AFTER the message is sent, so if the producer never sends a message the metadata is never refreshed
+
 ### 优点
 1. 负载在brokers之间的自动分布；
 2. broker借助zero-copy实现零拷贝发送到消费者；
@@ -5,4 +57,95 @@
 4. kafka streams api将状态存储自动备份到集群；
 5. broker故障的时候partition主动重新选举；
 
-### 优化吞吐量
+### 启动流程
+&emsp; Kafka启动主要在server.KafkaServer的startup方法中实现，具体步骤如下所示：  
+1. kafkaScheduler.startup()  
+&emsp; 启动任务调度线程池，默认10个线程，主要负责后台任务的处理，比如：日志清理工作。  
+2. initZk  
+&emsp; 连接到zk服务器；创建通用节点。  
+3. createLogManager  
+&emsp; LogManager是kafka的子系统，负责log的创建，检索及清理。所有的读写操作由单个的日志实例来代理。  
+4. socketServer.startup  
+&emsp;SocketServer是nio的socket服务器，线程模型是：1个Acceptor线程处理新连接，Acceptor还有多个处理器线程，每个处理器线程拥有自己的selector和多个读socket请求Handler线程。handler线程处理请求并产生响应写给处理器线程。   
+&emsp; num.network.threads:处理网络请求的线程数，默认3个；num.io.threads:处理IO的线程数，默认8个；  
+5. replicaManager  
+&emsp; 副本管理器   
+6. offsetManager  
+&emsp;创建offset管理器  
+7. kafkaController  
+&emsp;创建controller  
+8. 创建apis和requestHandlerPool  
+&emsp;主要用来处理用户的请求  
+9. topicConfigManager  
+&emsp; topic管理器  
+10. kafkaHealthcheck  
+&emsp; 心跳检查  
+11. 
+
+### 优化  
+* request.required.acks  
+* min.insync.replicas：当request.required.acks设置为-1时生效。  
+&emsp; 要保证数据写入到Kafka是安全的，高可靠的，需要如下的配置：  
+* topic的配置：replication.factor>=3,即副本数至少是3个；2<=min.insync.replicas<=replication.factor  
+* broker的配置：leader的选举条件unclean.leader.election.enable=false  
+* producer的配置：request.required.acks=-1(all)，producer.type=sync  
+### 消息传输保证
+At most once: 消息可能会丢，但绝不会重复传输   
+At least once：消息绝不会丢，但可能会重复传输  
+Exactly once：每条消息肯定会被传输一次且仅传输一次  
+
+### Que
+
+* Kafka的用途有哪些？使用场景如何？
+Kafka中的ISR、AR又代表什么？ISR的伸缩又指什么
+Kafka中的HW、LEO、LSO、LW等分别代表什么？
+Kafka中是怎么体现消息顺序性的？
+Kafka中的分区器、序列化器、拦截器是否了解？它们之间的处理顺序是什么？
+Kafka生产者客户端的整体结构是什么样子的？
+Kafka生产者客户端中使用了几个线程来处理？分别是什么？
+Kafka的旧版Scala的消费者客户端的设计有什么缺陷？
+“消费组中的消费者个数如果超过topic的分区，那么就会有消费者消费不到数据”这句话是否正确？如果不正确，那么有没有什么hack的手段？
+消费者提交消费位移时提交的是当前消费到的最新消息的offset还是offset+1?
+有哪些情形会造成重复消费？
+那些情景下会造成消息漏消费？
+KafkaConsumer是非线程安全的，那么怎么样实现多线程消费？
+简述消费者与消费组之间的关系
+当你使用kafka-topics.sh创建（删除）了一个topic之后，Kafka背后会执行什么逻辑？
+topic的分区数可不可以增加？如果可以怎么增加？如果不可以，那又是为什么？
+topic的分区数可不可以减少？如果可以怎么减少？如果不可以，那又是为什么？
+创建topic时如何选择合适的分区数？
+Kafka目前有那些内部topic，它们都有什么特征？各自的作用又是什么？
+优先副本是什么？它有什么特殊的作用？
+Kafka有哪几处地方有分区分配的概念？简述大致的过程及原理
+简述Kafka的日志目录结构
+Kafka中有那些索引文件？
+如果我指定了一个offset，Kafka怎么查找到对应的消息？
+如果我指定了一个timestamp，Kafka怎么查找到对应的消息？
+聊一聊你对Kafka的Log Retention的理解
+聊一聊你对Kafka的Log Compaction的理解
+聊一聊你对Kafka底层存储的理解（页缓存、内核层、块层、设备层）
+聊一聊Kafka的延时操作的原理
+聊一聊Kafka控制器的作用
+消费再均衡的原理是什么？（提示：消费者协调器和消费组协调器）
+Kafka中的幂等是怎么实现的
+Kafka中的事务是怎么实现的（这题我去面试6加被问4次，照着答案念也要念十几分钟，面试官简直凑不要脸）
+Kafka中有那些地方需要选举？这些地方的选举策略又有哪些？
+失效副本是指什么？有那些应对措施？
+多副本下，各个副本中的HW和LEO的演变过程
+为什么Kafka不支持读写分离？
+Kafka在可靠性方面做了哪些改进？（HW, LeaderEpoch）
+Kafka中怎么实现死信队列和重试队列？
+Kafka中的延迟队列怎么实现（这题被问的比事务那题还要多！！！听说你会Kafka，那你说说延迟队列怎么实现？）
+Kafka中怎么做消息审计？
+Kafka中怎么做消息轨迹？
+Kafka中有那些配置参数比较有意思？聊一聊你的看法
+Kafka中有那些命名比较有意思？聊一聊你的看法
+Kafka有哪些指标需要着重关注？
+怎么计算Lag？(注意read_uncommitted和read_committed状态下的不同)
+Kafka的那些设计让它有如此高的性能？
+Kafka有什么优缺点？
+还用过什么同质类的其它产品，与Kafka相比有什么优缺点？
+为什么选择Kafka?
+在使用Kafka的过程中遇到过什么困难？怎么解决的？
+怎么样才能确保Kafka极大程度上的可靠性？
+聊一聊你对Kafka生态的理解
