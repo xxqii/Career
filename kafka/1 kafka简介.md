@@ -94,6 +94,27 @@ At most once: 消息可能会丢，但绝不会重复传输
 At least once：消息绝不会丢，但可能会重复传输  
 Exactly once：每条消息肯定会被传输一次且仅传输一次  
 
+1、网络和io操作线程配置优化  
+# broker处理消息的最大线程数（默认为3）  
+num.network.threads=cpu核数+1  
+# broker处理磁盘IO的线程数   
+num.io.threads=cpu核数*2  
+ 
+2、log数据文件刷盘策略   
+# 每当producer写入10000条消息时，刷数据到磁盘  
+log.flush.interval.messages=10000  
+# 每间隔1秒钟时间，刷数据到磁盘  
+log.flush.interval.ms=1000  
+
+3、日志保留策略配置  
+# 保留三天，也可以更短 （log.cleaner.delete.retention.ms）  
+log.retention.hours=72  
+# 段文件配置1GB，有利于快速回收磁盘空间，重启kafka加载也会加快(如果文件过小，则文件数量比较多，kafka启动时是单线程扫描目录(log.dir)下所有数据文件  
+log.segment.bytes=1073741824  
+
+4、Replica相关配置  
+default.replication.factor:3  
+
 ### Que
 
 * Kafka的用途有哪些？使用场景如何？
