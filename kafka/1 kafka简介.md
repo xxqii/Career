@@ -425,43 +425,115 @@ default.replication.factor:3
 
 ### Que
 
-* Kafka的用途有哪些？使用场景如何？
-Kafka中的ISR、AR又代表什么？ISR的伸缩又指什么
-Kafka中的HW、LEO、LSO、LW等分别代表什么？
-Kafka中是怎么体现消息顺序性的？
-Kafka中的分区器、序列化器、拦截器是否了解？它们之间的处理顺序是什么？
-Kafka生产者客户端的整体结构是什么样子的？
-Kafka生产者客户端中使用了几个线程来处理？分别是什么？
-Kafka的旧版Scala的消费者客户端的设计有什么缺陷？
-“消费组中的消费者个数如果超过topic的分区，那么就会有消费者消费不到数据”这句话是否正确？如果不正确，那么有没有什么hack的手段？
-消费者提交消费位移时提交的是当前消费到的最新消息的offset还是offset+1?
-有哪些情形会造成重复消费？
-那些情景下会造成消息漏消费？
-KafkaConsumer是非线程安全的，那么怎么样实现多线程消费？
-简述消费者与消费组之间的关系
-当你使用kafka-topics.sh创建（删除）了一个topic之后，Kafka背后会执行什么逻辑？
-topic的分区数可不可以增加？如果可以怎么增加？如果不可以，那又是为什么？
-topic的分区数可不可以减少？如果可以怎么减少？如果不可以，那又是为什么？
-创建topic时如何选择合适的分区数？
-Kafka目前有那些内部topic，它们都有什么特征？各自的作用又是什么？
-优先副本是什么？它有什么特殊的作用？
-Kafka有哪几处地方有分区分配的概念？简述大致的过程及原理
-简述Kafka的日志目录结构
-Kafka中有那些索引文件？
-如果我指定了一个offset，Kafka怎么查找到对应的消息？
-如果我指定了一个timestamp，Kafka怎么查找到对应的消息？
-聊一聊你对Kafka的Log Retention的理解
-聊一聊你对Kafka的Log Compaction的理解
-聊一聊你对Kafka底层存储的理解（页缓存、内核层、块层、设备层）
-聊一聊Kafka的延时操作的原理
-聊一聊Kafka控制器的作用
-消费再均衡的原理是什么？（提示：消费者协调器和消费组协调器）
-Kafka中的幂等是怎么实现的
-Kafka中的事务是怎么实现的（这题我去面试6加被问4次，照着答案念也要念十几分钟，面试官简直凑不要脸）
-Kafka中有那些地方需要选举？这些地方的选举策略又有哪些？
-失效副本是指什么？有那些应对措施？
-多副本下，各个副本中的HW和LEO的演变过程
-为什么Kafka不支持读写分离？
+* Kafka的用途有哪些？使用场景如何？  
+&emsp; 异步处理、解耦、削峰、消息队列。使用场景例如：秒杀系统的中间件。
+  
+* Kafka中的ISR、AR又代表什么？ISR的伸缩又指什么？  
+&emsp; ISR(In-Sync Replicas)/AR(Assigned Replicas)，在kafka中一个Partition有多个Replication，多副本会选举产生一个Leader，负责客户端的读写请求，然后Follower从Leader Fetch数据，达到主从数据一致的效果。
+kafka维护两个同步列表AR代表所有的副本，ISR代表副本同步队列。ISR是AR的一个子集，ISR中的副本才可以选举为Leader。
+副本从Leader同步数据有延迟，包括时间延迟replica.lag.time.max.ms和日志条数延迟replica.lag.max.messages，当任意一个延迟达到kafka的配置值，就将副本从ISR移除，添加到OSR。AR=ISR+OSR。  
+
+* Kafka中的HW、LEO、LSO、LW等分别代表什么？  
+&emsp; LEO: LogEndOffset的缩写,表示partition中最后一条日志的offset值。
+HW: HighWatermark的缩写，表示Consumer能够看到的此partition的offset值，HW之前的日志都可以被消费者消费。  
+LSO: LSO特指LogStableOffset，  
+LW:  Low Watermark 的缩写，代表 AR 集合中最小的 logStartOffset 值。  
+
+* Kafka中是怎么体现消息顺序性的？  
+&emsp; 同一个Partition中的消息是顺序的，如果要保证消息的顺序可以给消息设置相同的key，让他们发送到同一个Partition即可。  
+
+* Kafka中的分区器、序列化器、拦截器是否了解？它们之间的处理顺序是什么？
+&emsp; 拦截器是在Kafka 0.10版本被引入的，多个拦截器可以组成拦截器链，拦截器需要继承ProducerInterceptor，在里面定义了一些事件：configure、onSend、onAcknowledgement、close等。可以在对应的事件中对消息进行处理。  
+&emsp; Kafka Producer在发送消息时必须配置的参数为：bootstrap.servers、key.serializer、value.serializer。序列化操作是在拦截器（Interceptor）执行之后并且在分配分区(partitions)之前执行的。  
+&emsp; 生产者发送消息的时候可以指定分区器或者key，kafka会根据分区器或者key将消息发送到对应的分区上。  
+
+* Kafka生产者客户端的整体结构是什么样子的？  
+
+* Kafka生产者客户端中使用了几个线程来处理？分别是什么？  
+&emsp; 老版本的生产者提供了两种发送消息的方式：同步、异步。同步方式直接发送消息；异步采用LinkedBlockingQueue缓存消息，然后由发送线程异步发送。  
+&emsp; 新版本的生产者有两个线程，Producer线程 -》 RecordAccumulator中的ProducerBatch缓存-》Send线程发送消息
+
+* Kafka的旧版Scala的消费者客户端的设计有什么缺陷？  
+&emsp; 旧版本的scala消费者会缓存发送的partition分区，默认10min内的消息会全部发送到一个分区，造成数据不均衡。  
+
+* “消费组中的消费者个数如果超过topic的分区，那么就会有消费者消费不到数据”这句话是否正确？如果不正确，那么有没有什么hack的手段？  
+&emsp; 多出的消费者线程无法消费数据。造成系统资源浪费。  
+
+* 消费者提交消费位移时提交的是当前消费到的最新消息的offset还是offset+1?  
+
+* 有哪些情形会造成重复消费？  
+&emsp; 先处理消息在提交offset的时候，如果消息处理到一半发生异常，再次消费的时候会产生重复。  
+
+* 那些情景下会造成消息漏消费？  
+&emsp; 先提交offset，在处理消息，此时如果消息处理过程中发生异常，则异常后面的消息会漏消费。  
+
+* KafkaConsumer是非线程安全的，那么怎么样实现多线程消费？  
+&emsp; 每个线程指定一个Consumer。  
+
+* 简述消费者与消费组之间的关系  
+&emsp; 消费者都属于消费者组。  
+
+* 当你使用kafka-topics.sh创建（删除）了一个topic之后，Kafka背后会执行什么逻辑？  
+
+* topic的分区数可不可以增加？如果可以怎么增加？如果不可以，那又是为什么？  
+&emsp; 分区数可以增加，在kafka bin目录下提供了kafka-topics.sh脚本，传入参数alter，可以设置topic的partition数量。  
+
+* topic的分区数可不可以减少？如果可以怎么减少？如果不可以，那又是为什么？  
+&emsp; 同上。  
+
+* 创建topic时如何选择合适的分区数？  
+&emsp; kafka的吞吐量是线性的，首先测试单个partition的吞吐量，然后根据项目的吞吐量设置partition个数，可以适当预留partition以备扩展。  
+
+* Kafka目前有那些内部topic，它们都有什么特征？各自的作用又是什么？  
+&emsp; __consumer_offsets，默认50个分区，保存消费者组对每个topic的每个partition消费的offset信息。  
+Transaction Log：保存事务状态的分区  
+
+* 优先副本是什么？它有什么特殊的作用？  
+&emsp; 优先副本指的是kafka集群重启后AR中的第一个副本，此副本会被选举为leader副本，加快kafka的服务时间。  
+
+* Kafka有哪几处地方有分区分配的概念？简述大致的过程及原理  
+
+* 简述Kafka的日志目录结构  
+&emsp; partition/segment (.log/.index/.snapshot/.timeindex)  
+
+* Kafka中有那些索引文件？  
+&emsp; .index记录消息的偏移地址，稀疏索引，每隔4096字节记录一条记录。
+.timeindex 保存时间戳到offset的映射关系。  
+
+* 如果我指定了一个offset，Kafka怎么查找到对应的消息？  
+* 如果我指定了一个timestamp，Kafka怎么查找到对应的消息？  
+
+* 聊一聊你对Kafka的Log Retention的理解
+&emsp; Kafka开启后台线程，每隔5min清理日志文件，有三种清理策略：基于时间、基于文件大小、基于startLogOffset  
+
+* 聊一聊你对Kafka的Log Compaction的理解  
+&emsp; 对于有相同 Key 的不同数据, 只保留最后一条, 前面的数据在合适的情况下删除.
+
+* 聊一聊你对Kafka底层存储的理解（页缓存、内核层、块层、设备层）  
+* 聊一聊Kafka的延时操作的原理  
+* 聊一聊Kafka控制器的作用  
+
+* 消费再均衡的原理是什么？（提示：消费者协调器和消费组协调器）  
+&emsp; 消费者协调器可以更新消费者缓存的MetaData，向组协调器申请加入/离开，向组协调器提交offset，保持到组协调器的心跳，被组协调器选为leader的消费者协调器负责消费者分区分配，结果发送给组协调器，  
+&emsp; 组协调器负责选举出消费者leader，下发leader返回的消费者分区分配结果给所有消费者，管理offset，提交到kafka保存，  
+
+* Kafka中的幂等是怎么实现的  
+&emsp;kafka实现了但分区/单会话的幂等行，Broker需要额外的空间保存状态，以实现消息去重。只需要把 Producer 的配置 enable.idempotence 设置为 true 即可。    
+生产者增加了producerId字段，消息中加入了序列号字段，broker保存消息发送过来的元信息，例如：pid，起始seq num和结束seq num。Broker接收消息后会和当前缓存中的pid和序列号判断，如果相同拒绝写入，否则更新缓存，写入数据。  
+如果需要跨会话、跨多个 topic-partition 的情况，需要使用 Kafka 的事务性来实现。  
+
+* Kafka中的事务是怎么实现的（这题我去面试6加被问4次，照着答案念也要念十几分钟，面试官简直凑不要脸）
+* Kafka中有那些地方需要选举？这些地方的选举策略又有哪些？
+&emsp; Controller选举：依赖zoo keeper的分布式事务，Partition Leader选举：从ISR中随机选举；  
+
+* 失效副本是指什么？有那些应对措施？  
+&emsp; 当ISR中的一个follower副本滞后leader副本的时间超过参数replica.lag.time.max.ms指定的值时即判定为副本失效  
+
+* 多副本下，各个副本中的HW和LEO的演变过程
+
+* 为什么Kafka不支持读写分离？  
+&emsp; 数据一致性问题和延迟问题；  
+
 Kafka在可靠性方面做了哪些改进？（HW, LeaderEpoch）
 Kafka中怎么实现死信队列和重试队列？
 Kafka中的延迟队列怎么实现（这题被问的比事务那题还要多！！！听说你会Kafka，那你说说延迟队列怎么实现？）
@@ -478,3 +550,7 @@ Kafka有什么优缺点？
 在使用Kafka的过程中遇到过什么困难？怎么解决的？
 怎么样才能确保Kafka极大程度上的可靠性？
 聊一聊你对Kafka生态的理解
+
+
+### blog  
+Kafka事务幂等性：http://matt33.com/2018/10/24/kafka-idempotent/  
