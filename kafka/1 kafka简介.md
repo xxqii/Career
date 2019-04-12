@@ -1,5 +1,5 @@
 ### 线程模型
-&emsp; Kafka采用一个Acceptor线程处理客户端的链接请求，然后轮询processors列表，将网络io事件交由processor处理。每个Acceptor和Processor都有自己的selector。  
+&emsp; Kafka采用一个Acceptor线程处理客户端的链接请求，然后轮询processors列表，将网络io事件交由processor处理。每个Acceptor和Processor都有自己的selector。避免大并发下单selector的性能下降。  
 &emsp; processor中的read方法读取请求内容，write将返回内容发送给客户端。如果read读取完毕，则构造Request对象，放入RequestChannel里等待处理。  
 &emsp; KafkaRequestHandlerPool负责处理RequestChannel的requestQueue里面的请求。线程池的数量通过num.io.threads设置(默认8个线程)。获取请求后调用ApiUtils处理请求。
 &emsp; KafkaApis会判断用户的请求类型RequestKeys，然后对应的处理函数处理请求，并得到response，通过调用RequestChannel的sendRespoonse将respoonse放入RequestChannel的responseQueue中。processor获取response并将结果返回客户端。  
@@ -426,7 +426,7 @@ default.replication.factor:3
 ### Que
 
 * Kafka的用途有哪些？使用场景如何？  
-&emsp; 异步处理、解耦、削峰、消息队列。使用场景例如：秒杀系统的中间件。
+&emsp; 异步处理、解耦、削峰、消息队列。使用场景例如：秒杀系统的中间件，日志收集等。
   
 * Kafka中的ISR、AR又代表什么？ISR的伸缩又指什么？  
 &emsp; ISR(In-Sync Replicas)/AR(Assigned Replicas)，在kafka中一个Partition有多个Replication，多副本会选举产生一个Leader，负责客户端的读写请求，然后Follower从Leader Fetch数据，达到主从数据一致的效果。
@@ -441,28 +441,36 @@ LW:  Low Watermark 的缩写，代表 AR 集合中最小的 logStartOffset 值�
 
 * Kafka中是怎么体现消息顺序性的？  
 &emsp; 同一个Partition中的消息是顺序的，如果要保证消息的顺序可以给消息设置相同的key，让他们发送到同一个Partition即可。  
+&emsp; 对同一个Partition中的消息，如果发送的顺序是AB，A发送失败需要重传，这个时候服务器接收到的消息就变为BA，如果需要保证此时消息的有序性，需要设置max.in.flight.requests.per.connection=1，保证每次发送新请求的时候，前一个请求已经被确认。
 
 * Kafka中的分区器、序列化器、拦截器是否了解？它们之间的处理顺序是什么？
 &emsp; 拦截器是在Kafka 0.10版本被引入的，多个拦截器可以组成拦截器链，拦截器需要继承ProducerInterceptor，在里面定义了一些事件：configure、onSend、onAcknowledgement、close等。可以在对应的事件中对消息进行处理。  
 &emsp; Kafka Producer在发送消息时必须配置的参数为：bootstrap.servers、key.serializer、value.serializer。序列化操作是在拦截器（Interceptor）执行之后并且在分配分区(partitions)之前执行的。  
-&emsp; 生产者发送消息的时候可以指定分区器或者key，kafka会根据分区器或者key将消息发送到对应的分区上。  
+&emsp; 生产者发送消息的时候可以指定分区器或者key，分区器必须实现Partitioner接口，kafka会根据分区器或者key将消息映射到对应的分区上。默认采用DefaultPartitioner轮询每个分区。  
+&emsp; KafkaProducer执行流程是：拦截器->序列化器->分区器。  
 
 * Kafka生产者客户端的整体结构是什么样子的？  
+&emsp; 生产者包括连个线程：KafkaProducer线程和Sender线程。  
+&emsp; KafkaProducer依次执行Interceptors.onSend、Serializer、Partitioner、然后将ProducerRecord缓存到RecordAccumulator。  
+RecordAccumulator内部是用一个ConcurrentMap（CopyOnWriteMap）保存消息，key是TopicPartition，value是ArrayDeque，存放ProducerBatch，ProducerBatch里面保存了消息内容，默认16kb；  
+Sender线程从RecordAccumulator里面取出消息，组装成ProduceRequest（Map<Integer, List<ProducerBatch>>），然后将ProducerRequest放入SocketChannel中；  
+NetworkClient从SocketChannel中取出消息，发送到kafka服务器，并将消息放入inFlightRequest中。等待服务器返回，调用对应消息的callback（包括拦截器里的onAckogement和异步发送的callback），并从inFlightRequest中删除对应的消息；  
 
 * Kafka生产者客户端中使用了几个线程来处理？分别是什么？  
 &emsp; 老版本的生产者提供了两种发送消息的方式：同步、异步。同步方式直接发送消息；异步采用LinkedBlockingQueue缓存消息，然后由发送线程异步发送。  
 &emsp; 新版本的生产者有两个线程，Producer线程 -》 RecordAccumulator中的ProducerBatch缓存-》Send线程发送消息
 
 * Kafka的旧版Scala的消费者客户端的设计有什么缺陷？  
-&emsp; 旧版本的scala消费者会缓存发送的partition分区，默认10min内的消息会全部发送到一个分区，造成数据不均衡。  
+&emsp; 旧版本的scala消费者会缓存发送的partition分区，避免服务器有大量的socket链接，默认10min内的消息会全部发送到一个分区，造成数据不均衡。  
 
 * “消费组中的消费者个数如果超过topic的分区，那么就会有消费者消费不到数据”这句话是否正确？如果不正确，那么有没有什么hack的手段？  
 &emsp; 多出的消费者线程无法消费数据。造成系统资源浪费。  
 
 * 消费者提交消费位移时提交的是当前消费到的最新消息的offset还是offset+1?  
+&emsp; 提交的是当前位移；  
 
 * 有哪些情形会造成重复消费？  
-&emsp; 先处理消息在提交offset的时候，如果消息处理到一半发生异常，再次消费的时候会产生重复。  
+&emsp; 消费者消费消息的时候，先处理消息后提交offset，如果消息处理到一半或者提交offset之前发生异常，消费者恢复后会重复消费发生异常的数据，造成重复消费。  
 
 * 那些情景下会造成消息漏消费？  
 &emsp; 先提交offset，在处理消息，此时如果消息处理过程中发生异常，则异常后面的消息会漏消费。  
@@ -486,10 +494,10 @@ LW:  Low Watermark 的缩写，代表 AR 集合中最小的 logStartOffset 值�
 
 * Kafka目前有那些内部topic，它们都有什么特征？各自的作用又是什么？  
 &emsp; __consumer_offsets，默认50个分区，保存消费者组对每个topic的每个partition消费的offset信息。  
-Transaction Log：保存事务状态的分区  
+__transaction_state：保存事务状态的分区  
 
 * 优先副本是什么？它有什么特殊的作用？  
-&emsp; 优先副本指的是kafka集群重启后AR中的第一个副本，此副本会被选举为leader副本，加快kafka的服务时间。  
+&emsp; 优先副本指的是kafka集群重启（或者故障恢复后）后AR中的第一个副本，此副本会被选举为leader副本，加快kafka的服务时间。  
 
 * Kafka有哪几处地方有分区分配的概念？简述大致的过程及原理  
 
@@ -501,9 +509,12 @@ Transaction Log：保存事务状态的分区
 .timeindex 保存时间戳到offset的映射关系。  
 
 * 如果我指定了一个offset，Kafka怎么查找到对应的消息？  
-* 如果我指定了一个timestamp，Kafka怎么查找到对应的消息？  
+&emsp; 根据TopicPartition找到对应的Partition数据目录；根据跳表定位到offset对应的.log\.index文件，二分查找index索引，定位到对应offset在.log文件中的物理偏移量，然后读取.log文件中的日志。参考OffsetIndex源码  
 
-* 聊一聊你对Kafka的Log Retention的理解
+* 如果我指定了一个timestamp，Kafka怎么查找到对应的消息？  
+&emsp; 根据timestamp从timeindex中找到对应的offset，然后从.index中找到.log中的物理偏移，然后读取日志文件；参考TimeIndex源码；  
+
+* 聊一聊你对Kafka的Log Retention的理解  
 &emsp; Kafka开启后台线程，每隔5min清理日志文件，有三种清理策略：基于时间、基于文件大小、基于startLogOffset  
 
 * 聊一聊你对Kafka的Log Compaction的理解  
@@ -511,6 +522,8 @@ Transaction Log：保存事务状态的分区
 
 * 聊一聊你对Kafka底层存储的理解（页缓存、内核层、块层、设备层）  
 * 聊一聊Kafka的延时操作的原理  
+&emsp; TimingWheel  
+
 * 聊一聊Kafka控制器的作用  
 
 * 消费再均衡的原理是什么？（提示：消费者协调器和消费组协调器）  
@@ -521,8 +534,19 @@ Transaction Log：保存事务状态的分区
 &emsp;kafka实现了但分区/单会话的幂等行，Broker需要额外的空间保存状态，以实现消息去重。只需要把 Producer 的配置 enable.idempotence 设置为 true 即可。    
 生产者增加了producerId字段，消息中加入了序列号字段，broker保存消息发送过来的元信息，例如：pid，起始seq num和结束seq num。Broker接收消息后会和当前缓存中的pid和序列号判断，如果相同拒绝写入，否则更新缓存，写入数据。  
 如果需要跨会话、跨多个 topic-partition 的情况，需要使用 Kafka 的事务性来实现。  
+http://matt33.com/2018/10/24/kafka-idempotent/  
 
-* Kafka中的事务是怎么实现的（这题我去面试6加被问4次，照着答案念也要念十几分钟，面试官简直凑不要脸）
+* Kafka中的事务是怎么实现的（这题我去面试6加被问4次，照着答案念也要念十几分钟，面试官简直凑不要脸）  
+&emsp; FIND_COORDINATOR（FindCoordinatorRequest） -》 INIT_PRODUCER_ID（InitProducerIdRequest） -》 METADATA（MetadataRequest） -》 ADD_PARTITIONS_TO_TXN（AddPartitionsToTxnRequest） -》 PRODUCE -》 END_TXN（EndTxnRequest）  
+&emsp; 1. 客户端发送FindCoordinatorRequest，找到Transaction Coordinator位置；（需要开启事务，并设置幂等性）  
+&emsp; 2. 客户端发送InitProducerIdRequest个体Transaction Coordinator，初始化pid。如果Transaction Coordinator是第一次收到包含有该Transaction ID的InitPidRequest请求，它将会把该<TransactionID, PID>存入Transaction Log，
+除了返回PID外，InitPidRequest还会执行如下任务：增加该PID对应的epoch。具有相同PID但epoch小于该epoch的其它Producer（如果有）新开启的事务将被拒绝；恢复（Commit或Abort）之前的Producer未完成的事务（如果有）。  
+注意：如果事务特性未开启，InitPidRequest可发送至任意Broker，并且会得到一个全新的唯一的PID。该Producer将只能使用幂等特性以及单一Session内的事务特性，而不能使用跨Session的事务特性。  
+&emsp; 3. 客户端可能给多个TopicPartition发送数据，给一个新的TopicPartition发送数据前，需要发送AddPartitionsToTxnRequest请求，Transaction Coordinator会将<TransactionId, Topic, Partition>存放在TransactionLog内，并将其状态置为BEGIN。
+如果该<Topic, Partition>为该事务中第一个<Topic, Partition>，Transaction Coordinator还会启动对该事务的计时（每个事务都有自己的超时时间）。  
+&emsp; 4. Producer通过一个或多个ProduceRequest发送一系列消息。除了应用数据外，该请求还包含了PID，epoch，和Sequence Number  
+http://www.jasongj.com/kafka/transaction/
+
 * Kafka中有那些地方需要选举？这些地方的选举策略又有哪些？
 &emsp; Controller选举：依赖zoo keeper的分布式事务，Partition Leader选举：从ISR中随机选举；  
 
