@@ -1,0 +1,8 @@
+1. 使用SpringBoot必须设置pom的parent依赖为spring-boot-starter-parent
+>
+  <parent>
+      <groupId>org.springframework.boot</groupId>
+      <artifactId>spring-boot-starter-parent</artifactId>
+      <version>1.3.2.RELEASE</version>
+      <relativePath/> <!-- lookup parent from repository -->
+  </parent>
